@@ -104,3 +104,61 @@
   - 只报了 32 线程与 16 线程结果，缺 1/4/8/16/32 完整扩展曲线
   - 缺具体 wall time / 峰值 RSS / CPU 利用率 / I-O 量 / 临时空间 / 重复次数
   - 总 2× 提速中 IO / SIMD 铺路 / FM-Index 三部分的独立贡献未拆分归因
+
+## 2026-06 - vg / vg minimizer 性能优化（AI 主导）
+
+### 背景
+- 工具: vg `minimizer` 子命令（gbwtgraph 库，`deps/gbwtgraph/src/index.cpp`）；上游 v1.74.1
+- 优化目标: 缩短 `vg minimizer -p --weighted --save-memory` 构建索引的 wall clock 与 CPU 开销
+- 数据集: chr1 小图（快速验证）+ HPRC v2.0 全基因组 pangenome（gbz ~6.4G，dist 索引）；10 线程
+- 硬件: AMD R5 3600 6 core 12 threads
+- 参与方: **AI 主导 profiling + 实现，人工审查方向与回退决策**；参考脚本 `run_v1.74.1_example.sh`
+- 结果（全基因组，CMS 方案 vs 原版 4-pass）:
+  - 频繁 kmer 阶段：1111s → 336s（**−70%**）
+  - 总 wall clock：28:48 → 14:46（**−49%**）
+  - User CPU：11277s → 4157s（**−63%**）
+  - 三重正确性验证通过：frequent kmer 数 84993 一致、MinimizerIndex 统计一致、`.zipcodes` MD5 完全一致
+
+### AI 做得好的地方
+- **Profiling 流程规范**：perf + flamegraph 双模式（dwarf 8.4GB 慢但完整，frame pointer 98MB 快且干净）；用 self/leaf profile + progress log wall-time 做相位归因，识破"OpenMP 栈终止于 libgomp 导致 folded-stack 相位归因不可信"的陷阱。
+- **热点定位准确**：识别出三大瓶颈——`frequent_kmers` 66%（`--save-memory` 4 次全图遍历）、OpenMP `critical` 43% 自旋、`cache_payloads` 单线程 10.5%；给出 P0–P4 优先级与预期收益表。
+- **小步验证 + 正确性闭环**：每个方案先 chr1 跑基线/优化对比，再全量；用 keys/unique/occurrences + `.zipcodes` MD5 做逻辑等价校验，正确解释了 `.min` 二进制布局差异（hash 表插入顺序变化，逻辑等价）。
+- **量化取舍清晰**：内存方案对比表（A 2-pass/B LZ4/C 缩 hash/D 回退）给出 frequent_kmers 阶段内存、总峰值增量、磁盘占用、遍历次数四列，并精确算出 `2^31` hash table = 32 GiB、cell 16 bytes 的来源。
+- **在人工引导下可调研外部方案**：人工提示"调研 jellyfish、kmc"后，对比 Jellyfish（CAS 无锁 + quotienting）、KMC3（磁盘分桶 + 基数排序），逐条评估对我们 `KmerIndex`（open-addressing + 多值 position 列表）的适用性，最终沉淀出 Count-Min Sketch 预过滤方向。**非主动发起**——AI 未在 P0-1 受阻时自发提议外部算法对标，需人工点拨才展开调研。
+- **正确性论证严谨**：CMS 预过滤用 one-sided error（只高估不低估）证明"高频 kmer 不会漏、低频不会误报"，并指出 `原始出现次数 ≥ 去重 position 数` 进一步消除假阴性；明确 CMS 只能做预过滤不能替代 KmerIndex。
+
+### AI 遗漏的地方
+- **磁盘开销低估**：P0-1 单趟外部分桶预估 ~62GB，实际产出 150GB+（2.4×），原因是只算了去重后 kmer 数，忽略了 overlapping haplotype windows 产出的重复记录；导致全量跑了一半被人工叫停。**应在落盘方案前对 chr1 实测单遍产物量再外推，而非按 distinct key 数算理论值。**
+- **方案 C 自查不彻底**：先说"`2^30` load factor 升到 0.80 超过 MAX_LOAD_FACTOR 0.77 不可行"，下一段重算发现实际 load ≈ 0.10 完全可行——同一回答内自相矛盾，说明对 `genome_size/2` 是"上界+2×余量"而非实际占用理解不牢。**人工追问后才理清。**
+- **墙钟 vs CPU 收益混报**：P1 实施后报"CPU −30%"但 wall clock 仅 −3~5%，最初未明确说明墙钟受限于串行插入、需 P0 才能真正缩墙钟，直到对比表才讲清。**结论应先分清 wall clock / user CPU / 利用率三类指标各自的含义与瓶颈归属。**
+- **编辑工具反复失败**：P0-1 实施时多次"重复循环实现但不编辑文件"，最后靠整体 Write 覆盖才完成。大段重构应直接用 Write 而非碎片段 StrReplace。
+- **没主动报报告缺口**：未提示缺 1/4/8/16/32 扩展曲线、重复次数、I/O 量等，沿用了和 bcSTAR 一样的报告短板。
+
+### 人工审查发现
+- **P0-1 落盘方向被否决**：150GB 临时文件不可接受，人工要求"内存增加不能超过 4GB"，迫使从磁盘分桶转向纯内存方案。
+- **方案 C 的"降低桶大小有风险"被叫停回退**：人工最终选择回退 Solution C，改用 CMS 预过滤——因为缩 hash table 虽然当下 load factor 安全，但失去了上界余量，对极端 pangenome 倾斜有风险。
+- **关键设计点要人工追问才浮现**：`hash_table_size = 2^31` 的来源（`genome_size/2` + MAX_LOAD_FACTOR=0.77 + 向上取 2 的幂）、`genome_size/2` 为何是 /2 而非 /4（GC 不均 + canonicalization 偏斜 + 2× 安全余量，实际 load 仅 0.05）都是人工逐层追问后 AI 才讲清的。
+- **CMS 阈值选择由人工确认**：采用方案 A（阈值不变，`ĉ > threshold`）而非更保守的 threshold/2，因为 CMS 不会低估。
+
+### 可复用的优化模式
+- **`#pragma omp critical` 自旋 → `std::mutex` + 增大 batch**：spinlock 烧 CPU，换 yielding mutex 消除自旋；batch 1024→8192 降锁频 8× 且 `removeDuplicates` 去重更有效。额外内存可忽略（每线程 ~0.5MB→4.5MB，相对 33 GiB 工作负载 < 0.02%）。
+- **多遍全图遍历 → 减遍历次数**：原版 `space_efficient` 用时间换空间（4 遍，每次 1 个 full-size KmerIndex）；减遍历是缩 CPU/wall 的主方向，但必须配合内存约束选路径。
+- **Count-Min Sketch 预过滤 + 精确验证**：第一遍用 ~1 GiB CMS 粗筛（无锁原子更新、支持并行），第二遍只对 `ĉ > threshold` 的候选做精确 KmerIndex 计数。利用 one-sided error 保证高频不漏、低频不误报；候选 KmerIndex 极小，遍历开销显著降低。
+- **`candidate_capacity` 按 CMS 候选数自适应**：扫描 CMS 第一行统计 `count > threshold` 的 slot 数作为 distinct candidate 下界，×2 余量，再 `minimum_size()`，避免拍脑袋。
+- **大段重构用 Write 整体覆盖**，碎片段 StrReplace 易循环失败。
+- **正确性校验三件套**：frequent kmer 数 + MinimizerIndex 统计（keys/unique/occurrences/load factor）+ `.zipcodes` MD5；`.min` 二进制布局差异属 hash 插入序变化，逻辑等价可接受。
+- **chr1 小图先行 + 全量收尾**：chr1 跑通再上全基因组，加速验证迭代。
+
+### 需要更新的 skill 内容
+- **建议下沉到 `OPTIMIZATION_PLAYBOOK.md`**：
+  - 通用模式："OpenMP critical 自旋 → std::mutex + 增大 batch"（含 batch 增大对内存影响可忽略的量化论证范式）
+  - 通用模式："多遍全图遍历的减遍历路径选择"（含内存/磁盘/遍历次数三维权衡表模板）
+  - 通用模式："Count-Min Sketch 预过滤 + 精确验证"（one-sided error 正确性证明 + 候选容量自适应）
+  - AI 审查要点：落盘方案外推必须按"单遍实测产物量 × 遍历数"而非 distinct key 理论值；wall clock / user CPU / 利用率三类指标分清瓶颈归属；大段重构直接 Write
+- **建议新增 `recipes/vg_minimizer.md`**：
+  - `frequent_kmers` 两种模式（`space_efficient` 4-pass vs 非 space_efficient 4-index 并行）与 middle-base 4 桶分片语义
+  - `hash_table_size = KmerIndex::minimum_size(genome_size/2)` 链路、`genome_size/2` 的 2× 余量来源、实际 load ~0.05
+  - `KmerIndex` cell 大小（payload=0 时 16B）与 `--save-memory` vs `--fast-counting` 的内存取舍
+  - `.zipcodes` MD5 作逻辑等价校验、`.min` 布局差异可接受的原因
+  - 全量 CMS 方案基线数字：频繁 kmer 1111→336s、wall 28:48→14:46
+- **本项目报告缺口（未来应补）**：缺 1/4/8/16/32 扩展曲线、重复次数、I/O 量、临时空间；CMS 方案中 Phase 1 sketch 更新 / Phase 2 精确计数 / MinimizerIndex 构建三段的独立贡献未拆分归因。
