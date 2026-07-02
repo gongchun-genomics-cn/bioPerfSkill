@@ -10,6 +10,9 @@
 - 硬件：CPU 型号、核数、内存、存储类型、操作系统、编译器/运行时。
 - 线程数，以及工具属于 CPU 密集、I/O 密集还是内存密集型。
 - 正确性要求：精确匹配、排序后等价、容差，或领域特定的等价规则。
+- 参考索引 / 主要数据结构的内存占用；是否 > 单 NUMA 节点内存（现代服务器单节点常 32–64 GB）。
+- 是否已有微架构基线（IPC、memory bound %、LLC miss、DRAM 带宽），或至少能用 `perf stat` 现场取到。
+- Batch size 与线程数是否已按硬件扫描过最优点。
 
 ## Profiling 指南
 
@@ -20,6 +23,10 @@
 - Python：`cProfile`、`py-spy`、`line_profiler`、内存 profiler。
 - I/O 行为：`strace -c`、文件数量与临时目录增长。
 - 内存：峰值 RSS、分配热点、对象大小、重复缓冲区。
+- Roofline 模型：先判断算法是 compute-bound 还是 memory-bound，再选优化方向。
+- 微架构 TMA：`perf stat` 的 IPC、memory bound %、LLC-load-misses、DRAM BW；`likwid-perfctr`；Intel VTune 的 Microarchitecture Exploration / Memory Access。每一步优化都要看到目标指标朝预期方向移动。
+- NUMA 拓扑：`numactl -H`、`numastat -p <pid>`、`lstopo`；核心数据结构 > 单 NUMA 节点内存时必查。
+- 线程扩展曲线：1 / 4 / 8 / 16 / 32 / N 线程各测一次，找加速比拐点；拐点意味着共享资源饱和（锁、内存带宽、NUMA 跨节点）。
 
 ## 常见生信瓶颈
 
@@ -31,6 +38,12 @@
 - 因全局锁、共享写入者或线程超订导致的糟糕线程扩展。
 - 排序或去重了超过必要量的数据。
 - 重复计算本可安全缓存的参考衍生数据。
+- 多线程 worker 各自 parse FASTQ/BAM/VCF 并竞争同一把 IO 锁，锁粒度粗、线程扩展比差。
+- 大参考索引跨 NUMA 节点分配（生信索引常达参考序列 10× 以上，绝对值 40 GB+ 常见），随机访问型 seed / lookup kernel 因跨节点访问延迟劣化。
+- 随机内存访问的 kernel（FM-Index、SA 二分、hash / B-tree lookup）没做批内多路 overlap 与软件预取，被内存延迟卡住。
+- `per-record → 全阶段串行` 的代码组织阻碍 SIMD / AVX-512 向量化。
+- `std::unordered_map` 在 10⁸+ 键规模同时输在性能与内存。
+- 单机内存装不下超大参考 / barcode 集合时仍在单进程内硬扛，未做数据分片并行。
 
 ## 改动策略
 
@@ -44,6 +57,20 @@
 6. 仅当正确性可被严格验证时，才引入算法改动。
 7. 仅对已证实的热点做底层重写。
 
+### 通用工程模式
+
+以下是已多次验证的可复用工程模式，可在上述 1–7 优先顺序内按需嵌入：
+
+- 共享 IO 锁 → 生产者-消费者 + 双缓冲/环形队列：单 IO 线程解析入队；worker 只争 buffer；buffer 数 ≥ 2× worker；锁只在入/出队时短暂持有。副产品是能直接观察瓶颈到底在 IO 还是算法。
+- 隐藏内存延迟三件套（适用 FM-Index / hash lookup / B-tree lookup 等随机访问 memory-bound kernel）：
+  1. 同批多路 overlap：同批 N 个独立请求（8~16 起步，需实测扫描），每次每个只推进一步，让计算与访存互相重叠。
+  2. 软件预取：`__builtin_prefetch` 在使用前 2–8 步发出，通常紧跟 (1) 之后加。
+  3. NUMA 感知分配：`numactl --membind` / `mbind` / `set_mempolicy` / first-touch 控制；核心数据结构 > 单 NUMA 节点时必做。
+  - 推荐应用顺序：先 overlap → 再 prefetch → 最后 NUMA（先解决批内并发，再解决访存局部性）。每一步都应独立地压低 memory bound %、拉高 IPC；没独立收益就回滚该步、复查瓶颈定位。
+- per-record loop → per-stage batched loop（SIMD 铺路）：把"对每条记录依次跑 A→B→C→D"改成"对 batch 内所有记录跑 A，再全跑 B…"；需引入分阶段承载中间结果的数据结构，避免每阶段重解析原始记录。这一步是 SIMD/AVX-512 的前置条件。
+- 哈希表容器替换：`std::unordered_map` → `folly::F14` / `absl::flat_hash_map` / `robin_hood::unordered_map`；替换前后测内存占用与查找延迟。
+- 数据分片：当"换实现"到顶（如键规模让最优哈希表也扛不住），按可复现规则切分数据并行处理，同时降内存并增并行。
+
 ## AI 审查要点
 
 人应审查 AI 是否：
@@ -55,6 +82,13 @@
 - 未经多次测量就宣称提速。
 - 在改善 wall time 的同时增加了内存占用。
 - 在多线程代码中引入了竞态条件。
+- 改索引结构或坐标编码后，是否同步更新了所有下游依赖（如 stitch / 坐标转换 / offset 语义）；正确性验证必须覆盖跨阶段对接点。
+- Batch size 是否实测扫描过而不是拍脑袋（不同硬件最优点不同，经验值常在 8~64）。
+- 状态机改造是否保留了原有 skip / short-circuit 语义（如某些 stage 在特定条件下应跳过）。
+- 是否检查过核心数据结构跨 NUMA 这个隐式假设（数据结构 > 单 NUMA 节点内存时必查）。
+- 是否只报告单一线程数下的提速，缺失 1/4/8/16/32 扩展曲线，掩盖共享资源饱和问题。
+- 是否只报告 wall time 而缺失微架构证据（memory bound %、IPC、LLC miss、DRAM BW）；没有 TMA 佐证的"命中瓶颈"结论不可信。
+- 是否把提速拆分归因到具体优化项，而不是只给一个"总倍数"（不然无法复用哪一项）。
 
 ## 输出模板
 
