@@ -70,6 +70,12 @@
 - per-record loop → per-stage batched loop（SIMD 铺路）：把"对每条记录依次跑 A→B→C→D"改成"对 batch 内所有记录跑 A，再全跑 B…"；需引入分阶段承载中间结果的数据结构，避免每阶段重解析原始记录。这一步是 SIMD/AVX-512 的前置条件。
 - 哈希表容器替换：`std::unordered_map` → `folly::F14` / `absl::flat_hash_map` / `robin_hood::unordered_map`；替换前后测内存占用与查找延迟。
 - 数据分片：当"换实现"到顶（如键规模让最优哈希表也扛不住），按可复现规则切分数据并行处理，同时降内存并增并行。
+- OpenMP `#pragma omp critical` 自旋 → `std::mutex` + 增大 batch：`critical` 默认是 spinlock（烧 CPU、表现为高 user time 但 wall 不降），换成 `std::mutex`（竞争时 yield 让出核心）；同时把 per-thread cache/batch 从 1024 提到 8192，降锁频 8× 且 `removeDuplicates` 去重更有效。额外内存可忽略（每线程 ~0.5MB→4.5MB，相对 GiB 级工作负载 < 0.1%）。**注意**：此模式主要降 user CPU 与利用率，wall clock 受限于串行插入工作量时不会显著下降，真正缩 wall clock 需配合减遍历或并发插入。
+- 多遍全图遍历的减遍历路径选择：原版"用时间换空间"为控制峰值内存而多遍遍历（如 `frequent_kmers` 4-pass，每遍只持 1 个 full-size index）。减遍历是缩 CPU/wall 的主方向，但路径必须在内存/磁盘/遍历次数三维上权衡：
+  - 内存路径：同时持多个 index（每遍处理多桶），峰值内存 = index 数 × 单 index 大小；hash table 容量可对每桶减半（实际 load 远低于 MAX_LOAD_FACTOR 时安全，但需查实际占用而非上界）。
+  - 磁盘路径：单趟遍历 + 外部分桶落盘，无内存增量但临时磁盘 = 单遍产物量 × 遍历数；**外推必须按 chr1 实测单遍产物量再乘倍数，不能按 distinct key 数算理论值**（重复记录/overlap 会使实际产物远大于 distinct 数）。
+  - sketch 预过滤路径：见下条，常是最优（既减遍历又省内存）。
+- Count-Min Sketch 预过滤 + 精确验证（适用"只需判断频率是否超阈值"的高频项筛选）：第一遍用 ~1 GiB CMS 粗筛（多行哈希、无锁原子递增、支持并行），第二遍只对 `ĉ > threshold` 的候选做精确哈希表计数。利用 CMS 的 one-sided error（只高估不低估）保证高频项不漏、低频项不误报；候选哈希表极小（只存候选），**既减遍历又省内存**。CMS 只能做预过滤器，不能替代精确计数（否则引入假阳性）。候选哈希表容量可按"扫描 CMS 第一行 `count > threshold` 的 slot 数 × 2 余量"自适应，而非拍脑袋。当"原始出现次数 ≥ 去重 position 数"时（同一 key 从多条路径被重复访问），CMS 计数天然 ≥ 精确去重计数，进一步消除假阴性。
 
 ## AI 审查要点
 
@@ -89,6 +95,10 @@
 - 是否只报告单一线程数下的提速，缺失 1/4/8/16/32 扩展曲线，掩盖共享资源饱和问题。
 - 是否只报告 wall time 而缺失微架构证据（memory bound %、IPC、LLC miss、DRAM BW）；没有 TMA 佐证的"命中瓶颈"结论不可信。
 - 是否把提速拆分归因到具体优化项，而不是只给一个"总倍数"（不然无法复用哪一项）。
+- 落盘方案外推是否按"chr1 实测单遍产物量 × 遍历数"而非 distinct key 理论值；重复记录 / overlap / 多路径访问会使实际磁盘占用远大于按 distinct 数算的理论值（vg 案例：预估 62GB 实际 150GB+）。
+- 是否分清 wall clock / user CPU / 利用率三类指标各自的瓶颈归属；换 mutex + 增大 batch 这类改动主要降 user CPU 与利用率，wall clock 受限于串行工作量时不会显著下降，混报会误导方向（真正缩 wall clock 需减遍历或并发化）。
+- 自查 hash table 容量结论时是否用了实际占用而非上界；同一回答内不应先说"load 超限不可行"再说"完全可行"自相矛盾——先算实际 distinct key / capacity，再对照 MAX_LOAD_FACTOR。
+- 是否主动调研外部同类工具算法作为对标（如 kmer 计数对标 Jellyfish/KMC）；AI 常需人工点拨才展开，受阻时应主动提议外部方案借鉴而非只在内部数据结构上打转。
 
 ## 输出模板
 
