@@ -210,3 +210,112 @@
   - AI 审查要点：不要为便利特性牺牲已拿到的并行收益（内联索引 vs 并行压缩的反例）；多文件时预警 `线程数×文件数` 句柄/内存
 - **已新增 `recipes/merge_bams.md`**：签名、dup 口径、正确性三件套、窗口基线表
 - **本项目报告缺口（未来应补）**：冷缓存、1/4/8/16/32 扩展曲线、重复次数、I-O 量、markdup on 的基准、Pass1 vs Pass2 vs 写线程三段独立耗时归因
+
+## 2026-07 - fastp 1.3.6 / PE gz→gz 工程优化（AI 主导）
+
+### 背景
+- 工具: fastp **1.3.6**（源码 `/zdswhst2/.../software/fastp`）；基线二进制 `bioPerfSkill/test/fastp.baseline`，优化版 `test/fastp.opt`
+- 优化目标: ≤32 线程相对基线 wall clock **≥20%**；保持 QC 语义一致
+- 数据集: HG002_20k（oracle）；hg001 20M PE gz→gz（主基准，热缓存）；硬件 Intel Xeon Gold 6442Y 96 逻辑核
+- 命令: `--detect_adapter_for_pe`，默认质量/长度过滤
+- 参与方: **AI 主导 profiling + 实现**；配方卡 `recipes/fastp.md`
+- 结果（20M PE，热缓存）:
+
+| 线程 | 基线 wall | 优化 wall | 加速 |
+|---:|---:|---:|---:|
+| 8 | 74.63s | 75.41s | ~0×（持平） |
+| 16 | 60.31s | 55.81s | **1.08×（+7.5%）** |
+| 32 | 425.43s | 56.68s | **7.5×（远超 +20%）** |
+
+正确性: 20k 解压后 FASTQ 逐字节一致 + JSON filtering_result 一致；20M JSON filtering_result 一致。
+
+### AI 做得好的地方
+- **先测线程扩展再改**: 发现 -w32 基线墙钟暴涨到 7min、CPU 仅 ~154%，而 -w8/16 正常——不是"再加压缩并行"能解决的。
+- **根因定位准**: 输入是普通 gzip（非 BGZF），BgzfMt 路径未启用；真正问题是 SPSC 队列「末节点不可消费」+ `PACK_IN_MEM_LIMIT=32` 与 `thread=32` 冲突 → 每 worker 队列长期只有 1 个 pack → worker 空等、reader 背压，近似活锁。
+- **改动可审查、主题聚焦**: (1) SPSC `canBeConsumed` 允许 `head==tail`；(2) `packInMemLimitForThreads = max(32, 3*thread)`；(3) pwrite 模式跳过空转 writer 线程；(4) offset 等待改 pause/yield；(5) 增大 igzip/FQ 缓冲。
+- **正确性闭环**: 先 20k oracle，再 20M JSON 对拍。
+
+### AI 遗漏的地方 / 报告缺口
+- -w8 无收益（甚至略慢）；-w16 仅 +7.5%。**目标在 -w32 达成**，低线程仍受双路串行 gunzip 下界约束（双 zcat 解压地板 ~33s）。
+- 全量 WES（~20GB）未跑完最终墙钟；perf 显示 `--detect_adapter_for_pe` 的 `checkKnownAdapters` 占短跑大量周期，尚未做第二主题优化。
+- 未报冷缓存、未做 3 次重复取中位数。
+
+### 可复用的优化模式
+- **SPSC / 无锁队列末节点可消费性**: `nextItemReady` 只发布后继时，队列里最后一个元素会永远不可消费；fan-out 到 N 个队列且 in-flight≈N 时必炸。
+- **背压上限必须随 fan-out 因子缩放**: `PACK_IN_MEM_LIMIT` 不能小于约 `2~3 × thread`。
+- **已并行的写路径上勿再拉空转 writer 线程**: pwrite 模式下 `isCompleted()==true` 仍 `spawn writerTask` 是浪费。
+- **先确认压缩容器格式**: `.gz` ≠ BGZF；并行解压优化对非 BGZF 无效。
+
+### 需要更新的 skill 内容
+- 已更新 `recipes/fastp.md` 基线表与瓶颈说明。
+- 建议下沉 PLAYBOOK: 「SPSC 末节点 + 背压与 fan-out 匹配」通用模式。
+
+## 2026-07-13 - fastp 1.3.6 / README 典型命令重基线
+
+### 背景
+- 工具: fastp 1.3.6；命令仅 `-i/-I/-o/-O/-w`（无 `--detect_adapter_for_pe`）
+- 优化目标: ≤16 线程，相对 baseline **最快墙钟** ≥20%
+- 数据集: hg001 20M PE gz；验收写出宜用本地盘（`/data/disk2`），Lustre 噪声大
+
+### AI 做得好的地方
+- 先重测 README 命令线程曲线再优化；发现初扫 35s 与热缓存本地盘 ~26s 差一截
+- perf：去掉 detect 后主热点是 overlap SIMD、Stats、Duplicate，压缩可用 ISA-L 换掉 libdeflate
+- 正确性：20k 解压 FASTQ + filtering/adapter 计数对齐
+
+### AI 遗漏的地方
+- 初扫把 Lustre 写出当基线，热起来后两端都变快；必须以交错 A/B 同条件对比
+- ISA-L level0 放大输出体积，写放大可抵消压缩加速
+
+### 可复用的优化模式
+- pwrite 并行压缩可换 ISA-L；gzip 字节可变，解压内容不变即可
+- overlap 搜索：先标量探头再 SIMD，砍掉大量 reject 路径上的 HWY dispatch
+- 输出路径选本地盘/tmpfs 做 CPU 对比，避免共享文件系统噪声
+
+### 需要更新的 skill 内容
+- recipes/fastp.md 基线表与 Round2 历史；典型命令保持 README-only
+
+## 2026-07-14 - fastp 1.3.6 / PE 配对修复 + 8/12/16 扫线（含 CPU/RSS）
+
+### 背景
+- 工具: fastp 1.3.6 opt（`software/fastp` → `test/fastp.opt`）
+- 问题: 活锁修复里 R1/R2 **各自** `mSeqCounter.fetch_add` → 写序交错 → **PE mates 错配**（WES 抽样可达数百分点）
+- 验收: ≤16 线程相对 baseline 最快墙钟 ≥20%；配对正确；记录 CPU%/RSS
+
+### 修复
+- PE pwrite：`mPairOutputSeq` 一次领取，`WriterThread::input(tid, data, seq)` 左右共用同一序号
+- SE：仍本 writer 内递增；`noteSeqHighWater` 保证 truncate 高水位无空洞
+
+### 正确性
+- 20k（-w4/8/14/16）、20M（各 100 万对）、WES（各 50 万对 ×4）：**配对 broken=0**
+- WES JSON：`filtering_result` / before / after / adapter_trimmed reads+bases 与 base 一致
+
+### 性能（2026-07-14，hg001 20M，本地盘，热缓存，交错 3 次）
+
+| 线程 | base best | opt best | 加速 | base/opt CPU% med | base/opt RSS med |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 40.76s | 31.24s | **+23%** | 861% / 881% | 1.25 / 1.32 GB |
+| 12 | 28.93s | 21.35s | **+26%** | 1209% / 1303% | 1.30 / 1.38 GB |
+| 16 | 29.33s | 18.26s | **+38%** | 1314% / 1525% | 1.35 / 1.44 GB |
+
+- 推荐：opt **`-w16`**（最快）；稳妥 **`-w12`**
+- 代价：RSS +6–7%；csv：`/data/disk2/private/gongchun/tmp/bioperf_t081216_1864088/times.csv`
+
+### WES 全量同条件扫线（2026-07-14；12 线程已订正）
+
+| 线程 | base best | opt best | 加速 | base/opt CPU% | base/opt RSS | 来源 |
+|---:|---:|---:|---:|---:|---:|---|
+| 8 | 223.1s | 162.3s | **+27%** | 866% / 942% | 1.23 / 1.30 GB | 扫线 2 次 |
+| 12 | 154.3s | 133.0s | **+14%** | 1274% / 1155% | ~1.27 / ~1.34 GB | **订正**（opt-first） |
+| 16 | 161.1s | 131.7s | **+18%** | 1233% / 1164% | 1.32 / 1.43 GB | 扫线 2 次 |
+
+- 原扫线 `-w12` base→opt 得 152/204s（−34%）作废：近满盘写回伪影。
+- 以后 WES 对比用 ABBA / `sync`；csv：`test/bench/wes_t081216_times.csv`；诊断：`test/bench/wes_w12_order_diag.txt`
+
+### 可复用的优化模式
+- **配对输出的全局序号必须共享**：两个独立 writer 各自 `fetch_add` 会打乱 mates；“防空洞的全局序号”与“R1/R2 同序”要一起设计
+- 线程扫线同时记 **wall + `%CPU` + MaxRSS**（`/usr/bin/time -v`），避免只报墙钟
+- **中等集与全量加速比不同**：20M `-w12` +26%，WES 订正后 +14%；全量仍须验收且注意写盘顺序
+- **大写盘对比陷阱**：base→opt 固定顺序 + 近满盘 + 压缩写放大 → 后者假性变慢（高墙钟、低 CPU%）；应用 ABBA 或落盘 `sync` 后再测
+
+### 需要更新的 skill 内容
+- 已写入 `recipes/fastp.md`「2026-07-14 线程扫线」与「WES 全量扫线」表，并注明 `-w12` 伪影结论
